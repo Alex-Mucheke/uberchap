@@ -1,0 +1,518 @@
+// Trusted Driver Network - PostgreSQL schema (Prisma)
+// PostGIS can be added later for proximity queries; coordinates are plain floats for now.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ------------------------------ Enums ------------------------------
+
+enum Role {
+  CUSTOMER
+  DRIVER
+  ADMIN
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+}
+
+enum VerificationStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum Availability {
+  OFFLINE
+  ONLINE
+}
+
+enum ConnectionStatus {
+  PENDING
+  ACTIVE
+  DISCONNECTED
+  BLOCKED
+}
+
+enum TrustStatus {
+  PENDING
+  TRUSTED
+  REVOKED
+}
+
+enum ServiceType {
+  RIDE
+  PARCEL
+  SHOPPING
+  FOOD_PICKUP
+  ERRAND
+}
+
+enum VehicleType {
+  SEDAN
+  HATCHBACK
+  SUV
+  VAN
+  PICKUP
+  MOTORBIKE
+  TUKTUK
+}
+
+enum DocumentKind {
+  NATIONAL_ID
+  DRIVING_LICENCE
+  PSV_BADGE
+  INSURANCE
+  VEHICLE_LOGBOOK
+  VEHICLE_PHOTO
+  PROFILE_PHOTO
+}
+
+enum BookingState {
+  DRAFT
+  REQUESTED
+  ACCEPTED
+  EN_ROUTE
+  ARRIVED
+  IN_PROGRESS
+  COMPLETED
+  DECLINED
+  CANCELLED
+  EXPIRED
+}
+
+enum ReferralState {
+  PROPOSED
+  CANDIDATE_ACCEPTED
+  CUSTOMER_APPROVED
+  CANDIDATE_DECLINED
+  CUSTOMER_REJECTED
+  EXPIRED
+  CANCELLED
+}
+
+enum PaymentMethod {
+  CASH
+  MPESA
+}
+
+enum PaymentState {
+  PENDING
+  PAID
+  FAILED
+  REFUNDED
+}
+
+enum ReportType {
+  REPORT
+  INCIDENT
+  COMPLAINT
+}
+
+enum ReportStatus {
+  OPEN
+  INVESTIGATING
+  RESOLVED
+  DISMISSED
+}
+
+enum SubscriptionState {
+  TRIAL
+  ACTIVE
+  PAST_DUE
+  CANCELLED
+}
+
+// ------------------------------ Identity ------------------------------
+
+model User {
+  id                String     @id @default(uuid())
+  name              String
+  email             String     @unique
+  phone             String     @unique
+  passwordHash      String
+  roles             Role[]
+  status            UserStatus @default(ACTIVE)
+  notificationPrefs Json?
+  createdAt         DateTime   @default(now())
+  updatedAt         DateTime   @updatedAt
+
+  driverProfile DriverProfile?
+
+  bookingsAsCustomer        Booking[]                  @relation("BookingCustomer")
+  bookingsRequested         Booking[]                  @relation("BookingRequestedDriver")
+  bookingsAssigned          Booking[]                  @relation("BookingAssignedDriver")
+  customerConnections       CustomerDriverConnection[] @relation("ConnCustomer")
+  driverCustomerConnections CustomerDriverConnection[] @relation("ConnDriver")
+  driverLinksA              DriverConnection[]         @relation("DriverLinkA")
+  driverLinksB              DriverConnection[]         @relation("DriverLinkB")
+  referralsProposed         Referral[]                 @relation("ReferralProposer")
+  referralsCandidate        Referral[]                 @relation("ReferralCandidate")
+  locations                 DriverLocation[]
+  notifications             Notification[]
+  messages                  Message[]
+  reviewsGiven              Review[]                   @relation("ReviewAuthor")
+  reviewsReceived           Review[]                   @relation("ReviewDriver")
+  reportsFiled              Report[]                   @relation("ReportReporter")
+  reportsAgainst            Report[]                   @relation("ReportTarget")
+  subscriptions             Subscription[]
+  auditLogs                 AdminAuditLog[]
+}
+
+model DriverProfile {
+  userId                    String             @id
+  user                      User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  bio                       String?
+  photoUrl                  String?
+  shareCode                 String             @unique
+  serviceArea               String?
+  verificationStatus        VerificationStatus @default(PENDING)
+  verificationNote          String?
+  availability              Availability       @default(OFFLINE)
+  // Only rounded (~1 km) coordinates are ever stored here; precise GPS exists only during active jobs.
+  shareApproxLocation       Boolean            @default(false)
+  approxLat                 Float?
+  approxLng                 Float?
+  approxUpdatedAt           DateTime?
+  requireConnectionApproval Boolean            @default(false)
+  createdAt                 DateTime           @default(now())
+  updatedAt                 DateTime           @updatedAt
+
+  vehicles  Vehicle[]
+  documents VerificationDocument[]
+  services  DriverService[]
+}
+
+model Vehicle {
+  id        String        @id @default(uuid())
+  driverId  String
+  driver    DriverProfile @relation(fields: [driverId], references: [userId], onDelete: Cascade)
+  plate     String        @unique
+  type      VehicleType
+  make      String
+  model     String
+  color     String
+  capacity  Int
+  active    Boolean       @default(true)
+  createdAt DateTime      @default(now())
+
+  documents VerificationDocument[]
+
+  @@index([driverId])
+}
+
+model VerificationDocument {
+  id           String             @id @default(uuid())
+  driverId     String
+  driver       DriverProfile      @relation(fields: [driverId], references: [userId], onDelete: Cascade)
+  vehicleId    String?
+  vehicle      Vehicle?           @relation(fields: [vehicleId], references: [id], onDelete: SetNull)
+  kind         DocumentKind
+  // Object-storage key in a PRIVATE bucket; access only via short-lived signed URLs.
+  storageKey   String
+  status       VerificationStatus @default(PENDING)
+  reviewedById String?
+  reviewNote   String?
+  createdAt    DateTime           @default(now())
+
+  @@index([driverId])
+  @@index([status])
+}
+
+model DriverService {
+  driverId    String
+  driver      DriverProfile @relation(fields: [driverId], references: [userId], onDelete: Cascade)
+  serviceType ServiceType
+  active      Boolean       @default(true)
+
+  @@id([driverId, serviceType])
+}
+
+// ------------------------------ Trusted network ------------------------------
+
+model CustomerDriverConnection {
+  id         String           @id @default(uuid())
+  customerId String
+  customer   User             @relation("ConnCustomer", fields: [customerId], references: [id], onDelete: Cascade)
+  driverId   String
+  driver     User             @relation("ConnDriver", fields: [driverId], references: [id], onDelete: Cascade)
+  status     ConnectionStatus @default(ACTIVE)
+  createdAt  DateTime         @default(now())
+  updatedAt  DateTime         @updatedAt
+
+  @@unique([customerId, driverId])
+  @@index([driverId])
+}
+
+// Pair is stored in canonical order (driverAId < driverBId) so a link exists at most once.
+model DriverConnection {
+  id          String      @id @default(uuid())
+  driverAId   String
+  driverA     User        @relation("DriverLinkA", fields: [driverAId], references: [id], onDelete: Cascade)
+  driverBId   String
+  driverB     User        @relation("DriverLinkB", fields: [driverBId], references: [id], onDelete: Cascade)
+  requestedBy String
+  trustStatus TrustStatus @default(PENDING)
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  @@unique([driverAId, driverBId])
+  @@index([driverBId])
+}
+
+// ------------------------------ Bookings ------------------------------
+
+model Booking {
+  id               String       @id @default(uuid())
+  customerId       String
+  customer         User         @relation("BookingCustomer", fields: [customerId], references: [id])
+  requestedDriverId String
+  requestedDriver  User         @relation("BookingRequestedDriver", fields: [requestedDriverId], references: [id])
+  assignedDriverId String?
+  assignedDriver   User?        @relation("BookingAssignedDriver", fields: [assignedDriverId], references: [id])
+  type             ServiceType
+  state            BookingState @default(REQUESTED)
+  // Whole KES. Always computed / validated on the server.
+  quote            Int
+  currency         String       @default("KES")
+  scheduledAt      DateTime?
+  passengerCount   Int          @default(1)
+  notes            String?
+  cancelledReason  String?
+  expiresAt        DateTime
+  completedAt      DateTime?
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+
+  rideDetails     RideDetails?
+  deliveryDetails DeliveryDetails?
+  errandDetails   ErrandDetails?
+  events          BookingEvent[]
+  referrals       Referral[]
+  payment         Payment?
+  messages        Message[]
+  review          Review?
+  locations       DriverLocation[]
+  reports         Report[]
+
+  @@index([customerId, state])
+  @@index([requestedDriverId, state])
+  @@index([assignedDriverId, state])
+  @@index([state, expiresAt])
+}
+
+model RideDetails {
+  bookingId     String  @id
+  booking       Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  pickupAddress String
+  pickupLat     Float
+  pickupLng     Float
+  dropoffAddress String
+  dropoffLat    Float
+  dropoffLng    Float
+  distanceKm    Float
+}
+
+// Later releases (Phase 7): schema is ready, API is not exposed yet.
+model DeliveryDetails {
+  bookingId        String  @id
+  booking          Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  pickupAddress    String
+  dropoffAddress   String
+  senderName       String
+  senderPhone      String
+  recipientName    String
+  recipientPhone   String
+  description      String
+  handlingNotes    String?
+  confirmationCode String?
+  proofKey         String?
+}
+
+model ErrandDetails {
+  bookingId           String    @id
+  booking             Booking   @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  storeOrDestination  String
+  taskDescription     String
+  spendingLimit       Int?
+  substitutionsAllowed Boolean  @default(false)
+  deadline            DateTime?
+  approvedBudget      Int?
+  proofKey            String?
+}
+
+// Immutable audit trail of every important state change.
+model BookingEvent {
+  id        String   @id @default(uuid())
+  bookingId String
+  booking   Booking  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  type      String
+  actorId   String?
+  metadata  Json?
+  createdAt DateTime @default(now())
+
+  @@index([bookingId, createdAt])
+}
+
+// ------------------------------ Referrals ------------------------------
+
+model Referral {
+  id                  String        @id @default(uuid())
+  bookingId           String
+  booking             Booking       @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  proposerId          String
+  proposer            User          @relation("ReferralProposer", fields: [proposerId], references: [id])
+  candidateId         String
+  candidate           User          @relation("ReferralCandidate", fields: [candidateId], references: [id])
+  state               ReferralState @default(PROPOSED)
+  revisedQuote        Int?
+  etaMinutes          Int?
+  expiresAt           DateTime
+  proposedAt          DateTime      @default(now())
+  candidateRespondedAt DateTime?
+  customerRespondedAt DateTime?
+  createdAt           DateTime      @default(now())
+  updatedAt           DateTime      @updatedAt
+
+  // A candidate can be proposed at most once per booking -> prevents referral loops.
+  @@unique([bookingId, candidateId])
+  @@index([candidateId, state])
+  @@index([state, expiresAt])
+}
+
+// ------------------------------ Location ------------------------------
+
+model DriverLocation {
+  id         String   @id @default(uuid())
+  driverId   String
+  driver     User     @relation(fields: [driverId], references: [id], onDelete: Cascade)
+  bookingId  String
+  booking    Booking  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  lat        Float
+  lng        Float
+  accuracy   Float?
+  capturedAt DateTime
+  // Short retention: rows are purged after expiresAt.
+  expiresAt  DateTime
+
+  @@index([bookingId, capturedAt])
+  @@index([expiresAt])
+}
+
+// ------------------------------ Payments ------------------------------
+
+model Payment {
+  id                String       @id @default(uuid())
+  bookingId         String       @unique
+  booking           Booking      @relation(fields: [bookingId], references: [id])
+  method            PaymentMethod
+  state             PaymentState @default(PENDING)
+  // Kept separate: service charge, shopping-item cost, platform fee and tip.
+  serviceCharge     Int
+  itemCost          Int          @default(0)
+  platformFee       Int          @default(0)
+  tip               Int          @default(0)
+  total             Int
+  providerReference String?      @unique
+  receiptNumber     String?      @unique
+  paidAt            DateTime?
+  rawCallback       Json?
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+}
+
+// ------------------------------ Comms ------------------------------
+
+model Message {
+  id        String   @id @default(uuid())
+  bookingId String
+  booking   Booking  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  senderId  String
+  sender    User     @relation(fields: [senderId], references: [id])
+  content   String
+  createdAt DateTime @default(now())
+
+  @@index([bookingId, createdAt])
+}
+
+model Notification {
+  id        String    @id @default(uuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type      String
+  title     String
+  body      String
+  data      Json?
+  readAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId, createdAt])
+}
+
+// ------------------------------ Trust & safety ------------------------------
+
+model Review {
+  id        String   @id @default(uuid())
+  bookingId String   @unique
+  booking   Booking  @relation(fields: [bookingId], references: [id])
+  authorId  String
+  author    User     @relation("ReviewAuthor", fields: [authorId], references: [id])
+  driverId  String
+  driver    User     @relation("ReviewDriver", fields: [driverId], references: [id])
+  rating    Int
+  comment   String?
+  createdAt DateTime @default(now())
+
+  @@index([driverId])
+}
+
+model Report {
+  id             String       @id @default(uuid())
+  type           ReportType   @default(REPORT)
+  status         ReportStatus @default(OPEN)
+  reporterId     String
+  reporter       User         @relation("ReportReporter", fields: [reporterId], references: [id])
+  targetUserId   String?
+  target         User?        @relation("ReportTarget", fields: [targetUserId], references: [id])
+  bookingId      String?
+  booking        Booking?     @relation(fields: [bookingId], references: [id])
+  category       String
+  description    String
+  resolutionNote String?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  @@index([status])
+}
+
+model Subscription {
+  id        String            @id @default(uuid())
+  driverId  String
+  driver    User              @relation(fields: [driverId], references: [id])
+  plan      String
+  state     SubscriptionState @default(TRIAL)
+  renewsAt  DateTime?
+  createdAt DateTime          @default(now())
+
+  @@index([driverId])
+}
+
+model AdminAuditLog {
+  id         String   @id @default(uuid())
+  adminId    String
+  admin      User     @relation(fields: [adminId], references: [id])
+  action     String
+  entityType String
+  entityId   String
+  metadata   Json?
+  createdAt  DateTime @default(now())
+
+  @@index([createdAt])
+}
